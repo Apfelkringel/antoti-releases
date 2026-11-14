@@ -1,0 +1,13 @@
+name: Probe gehostete Runner
+on:
+  workflow_dispatch:
+  push:
+    paths: [".github/workflows/probe.yml"]
+jobs:
+  probe:
+    strategy:
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-14]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - run: echo "läuft auf ${{ matrix.os }}"
