@@ -1,0 +1,209 @@
+# Baut die Installer von Antoti auf Rechnern von GitHub, für jedes System auf seinem eigenen: Windows, macOS
+# (Apple Silicon) und Linux. Dafür braucht es weder den Windows-PC noch den Mac des Herstellers.
+#
+# Der Quellcode kommt aus dem privaten Repository Apfelkringel/antoti, mit einem Deploy-Key, der nur lesen darf
+# (Secret ANTOTI_SOURCE_KEY). Der Google-Client für Kunden (ANTOTI_GOOGLE_CLIENT) steckt ohnehin in jedem Installer.
+#
+# Signiert wird hier nicht: Der Workflow legt die Dateien in einen Entwurf v<Version>. Das Manifest signiert der
+# Hersteller mit seinem Schlüssel außerhalb von GitHub (scripts/release.py sign im Repository antoti) und
+# veröffentlicht erst dann. So kann auch jemand, der dieses Konto übernimmt, keinem Gerät ein Update unterschieben.
+#
+# Starten: Actions › „Installer bauen“ › Run workflow, oder
+#   gh workflow run build.yml -R Apfelkringel/antoti-releases -f ref=<Commit oder Branch>
+name: Installer bauen
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Commit, Branch oder Tag im Repository antoti
+        required: true
+        default: main
+      platforms:
+        description: Welche Systeme (Leerzeichen dazwischen)
+        required: true
+        default: windows-x86_64 darwin-arm64 linux-x86_64
+      release:
+        description: Die Dateien in den Entwurf v<Version> legen (sonst nur als Artefakte des Laufs)
+        type: boolean
+        default: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: build-${{ inputs.ref }}
+  cancel-in-progress: false
+
+env:
+  INNO_VERSION: 6.7.1
+  # SHA-256 des NuGet-Pakets Tools.InnoSetup 6.7.1; dasselbe ISCC.exe, mit dem bisher gebaut wurde.
+  INNO_SHA256: 00a5a07e8a4bd3a30364cb579d744677b37adfc22e365099cb01b8bd1e651828
+
+jobs:
+  plan:
+    name: Systeme wählen
+    runs-on: ubuntu-latest
+    outputs:
+      matrix: ${{ steps.plan.outputs.matrix }}
+    steps:
+      - id: plan
+        env:
+          PLATFORMS: ${{ inputs.platforms }}
+        run: |
+          python3 - <<'EOF' >> "$GITHUB_OUTPUT"
+          import json, os
+          runners = {"windows-x86_64": "windows-latest", "darwin-arm64": "macos-latest", "linux-x86_64": "ubuntu-latest"}
+          wanted = os.environ["PLATFORMS"].split()
+          unknown = [name for name in wanted if name not in runners]
+          if unknown or not wanted:
+              raise SystemExit("Unbekannte oder keine Systeme: %s (bekannt: %s)" % (unknown, " ".join(runners)))
+          print("matrix=" + json.dumps({"include": [{"platform": name, "runner": runners[name]} for name in wanted]}))
+          EOF
+
+  build:
+    name: ${{ matrix.platform }}
+    needs: plan
+    strategy:
+      fail-fast: false
+      matrix: ${{ fromJSON(needs.plan.outputs.matrix) }}
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 60
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+    defaults:
+      run:
+        shell: bash
+    steps:
+      - name: Quellcode holen
+        uses: actions/checkout@v4
+        with:
+          repository: Apfelkringel/antoti
+          ref: ${{ inputs.ref }}
+          ssh-key: ${{ secrets.ANTOTI_SOURCE_KEY }}
+          persist-credentials: false
+          path: antoti
+
+      - name: Python für die Bauskripte
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.13"
+
+      - name: Version
+        id: version
+        working-directory: antoti
+        run: |
+          version=$(python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "Antoti $version aus $(git rev-parse HEAD)" >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Google-Client
+        env:
+          GOOGLE_CLIENT: ${{ secrets.ANTOTI_GOOGLE_CLIENT }}
+        run: |
+          if [ -z "$GOOGLE_CLIENT" ]; then echo "::error::Secret ANTOTI_GOOGLE_CLIENT fehlt."; exit 1; fi
+          printf '%s' "$GOOGLE_CLIENT" > "$RUNNER_TEMP/google-client.json"
+
+      - name: Paket bauen
+        working-directory: antoti
+        run: python scripts/build_bundle.py --platform "${{ matrix.platform }}" --google-client "$RUNNER_TEMP/google-client.json"
+
+      - name: Inno Setup
+        if: matrix.platform == 'windows-x86_64'
+        run: |
+          package="$RUNNER_TEMP/innosetup.nupkg"
+          curl -fsSL --retry 5 -o "$package" "https://www.nuget.org/api/v2/package/Tools.InnoSetup/$INNO_VERSION"
+          echo "$INNO_SHA256  $package" | sha256sum -c -
+          python -m zipfile -e "$package" "$RUNNER_TEMP/innosetup"
+          echo "ANTOTI_ISCC=$(cygpath -w "$RUNNER_TEMP/innosetup/tools/ISCC.exe")" >> "$GITHUB_ENV"
+
+      - name: Installer bauen (Windows)
+        if: matrix.platform == 'windows-x86_64'
+        working-directory: antoti
+        run: python scripts/build_windows_installer.py
+
+      - name: Installer bauen (macOS, Linux)
+        if: matrix.platform != 'windows-x86_64'
+        working-directory: antoti
+        run: python scripts/build_posix_package.py
+
+      - name: Google-Client entfernen
+        if: always()
+        run: rm -f "$RUNNER_TEMP/google-client.json"
+
+      - name: Prüfsumme
+        working-directory: antoti/build/installer
+        run: |
+          ls -la
+          for file in Antoti*; do
+            echo "\`$file\` $(wc -c < "$file" | tr -d ' ') Bytes, SHA-256 $(python -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$file")" >> "$GITHUB_STEP_SUMMARY"
+          done
+
+      - name: Datei ablegen
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.platform }}
+          path: antoti/build/installer/Antoti*
+          if-no-files-found: error
+          retention-days: 14
+          compression-level: 0
+
+  release:
+    name: Entwurf v${{ needs.build.outputs.version }}
+    needs: build
+    if: inputs.release
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Dateien holen
+        uses: actions/download-artifact@v4
+        with:
+          path: files
+          merge-multiple: true
+
+      - name: In den Entwurf legen
+        env:
+          GH_TOKEN: ${{ github.token }}
+          VERSION: ${{ needs.build.outputs.version }}
+        run: |
+          set -euo pipefail
+          tag="v$VERSION"
+          ls -la files
+          if ! state=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json isDraft --jq .isDraft 2>/dev/null); then
+            gh release create "$tag" -R "$GITHUB_REPOSITORY" --draft --title "Antoti $VERSION" \
+              --notes "Entwurf aus „Installer bauen“. Wird veröffentlicht, sobald der Hersteller das Manifest signiert hat." \
+              files/*
+          elif [ "$state" = "true" ]; then
+            gh release upload "$tag" -R "$GITHUB_REPOSITORY" --clobber files/*
+          else
+            # Ein veröffentlichtes Release bekommt nur Dateien, die ihm fehlen; was Geräte schon laden, bleibt.
+            existing=$(gh release view "$tag" -R "$GITHUB_REPOSITORY" --json assets --jq '.assets[].name')
+            for file in files/*; do
+              if grep -qxF "$(basename "$file")" <<< "$existing"; then
+                echo "::warning::$tag ist veröffentlicht und hat $(basename "$file") schon; die Datei bleibt, wie sie ist."
+              else
+                gh release upload "$tag" -R "$GITHUB_REPOSITORY" "$file"
+              fi
+            done
+          fi
+          {
+            echo "Dateien liegen bei $tag. Signieren und veröffentlichen (im Repository antoti, mit dem Schlüssel des Herstellers):"
+            echo '```'
+            echo "gh release download $tag -R $GITHUB_REPOSITORY -p 'Antoti*' -D build/release-files"
+            echo "scripts/release.py sign --since <älteste Version, die ein Gerät noch hat> \\"
+            for file in files/*; do
+              name=$(basename "$file")
+              case "$name" in
+                *Setup*.exe) platform=windows-x86_64 ;;
+                *macos-arm64.dmg) platform=darwin-arm64 ;;
+                *linux-x86_64.tar.gz) platform=linux-x86_64 ;;
+                *) continue ;;
+              esac
+              echo "  --artifact $platform=build/release-files/$name \\"
+            done
+            echo "  --out build/release/$VERSION/antoti-release.json"
+            echo "gh release upload $tag -R $GITHUB_REPOSITORY build/release/$VERSION/antoti-release.json"
+            echo "gh release edit $tag -R $GITHUB_REPOSITORY --draft=false --latest"
+            echo '```'
+          } >> "$GITHUB_STEP_SUMMARY"
