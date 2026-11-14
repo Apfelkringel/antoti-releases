@@ -7,7 +7,7 @@ jobs:
   probe:
     strategy:
       matrix:
-        os: [ubuntu-latest, windows-latest, macos-14]
+        os: [macos-latest, macos-15, macos-26]
     runs-on: ${{ matrix.os }}
     steps:
-      - run: echo "läuft auf ${{ matrix.os }}"
+      - run: sw_vers; uname -m; echo "läuft auf ${{ matrix.os }}"
