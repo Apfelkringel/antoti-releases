@@ -117,7 +117,8 @@ jobs:
 
       - name: Paket bauen
         working-directory: antoti
-        run: python scripts/build_bundle.py --platform "${{ matrix.platform }}" --google-client "$RUNNER_TEMP/google-client.json"
+        # Ohne --platform baut das Skript für das System, auf dem es läuft; --platform hieße nur laden.
+        run: python scripts/build_bundle.py --google-client "$RUNNER_TEMP/google-client.json"
 
       - name: Inno Setup
         if: matrix.platform == 'windows-x86_64'
