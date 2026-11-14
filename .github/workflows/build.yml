@@ -76,16 +76,27 @@ jobs:
         shell: bash
     steps:
       - name: Quellcode holen
-        uses: actions/checkout@v4
+        uses: actions/checkout@v5
         with:
           repository: Apfelkringel/antoti
-          ref: ${{ inputs.ref }}
           ssh-key: ${{ secrets.ANTOTI_SOURCE_KEY }}
           persist-credentials: false
+          fetch-depth: 0
           path: antoti
 
+      # actions/checkout nimmt keine abgekürzten Commits; git löst Kürzel, Branch und Tag gleich auf.
+      - name: Stand wählen
+        working-directory: antoti
+        env:
+          REF: ${{ inputs.ref }}
+        run: |
+          commit=$(git rev-parse --verify --quiet "$REF^{commit}" || git rev-parse --verify --quiet "origin/$REF^{commit}") \
+            || { echo "::error::$REF ist im Repository antoti weder Commit noch Branch noch Tag."; exit 1; }
+          git checkout --quiet --detach "$commit"
+          git status --short | head -5
+
       - name: Python für die Bauskripte
-        uses: actions/setup-python@v5
+        uses: actions/setup-python@v6
         with:
           python-version: "3.13"
 
