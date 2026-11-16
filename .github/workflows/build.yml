@@ -11,6 +11,8 @@
 # Starten: Actions › „Installer bauen“ › Run workflow, oder
 #   gh workflow run build.yml -R Apfelkringel/antoti-releases -f ref=<Commit oder Branch>
 name: Installer bauen
+# Der Name nennt den Stand, damit scripts/daily_release.py in antoti seinen eigenen Lauf erkennt.
+run-name: Installer bauen ${{ inputs.ref }}
 
 on:
   workflow_dispatch:
