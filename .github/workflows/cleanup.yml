@@ -1,7 +1,8 @@
 # Hier gibt es nur ein Release: das neueste. Sobald eines veröffentlicht ist, löscht dieser Workflow alle anderen
-# samt Tag, auch liegengebliebene Entwürfe älterer Versionen. Geräte (src/antoti/updates.py), die Knöpfe der Website
+# mit älterer Version samt Tag, auch liegengebliebene Entwürfe. Geräte (src/antoti/updates.py), die Knöpfe der Website
 # und install-mac.sh lesen nur releases/latest; ältere Fassungen braucht keiner von ihnen.
-# Ein Entwurf einer neueren Version bleibt, denn das ist ein Bau, der noch signiert wird.
+# Was eine neuere Version hat, bleibt: ein Bau, der noch signiert wird, oder ein Release, das gerade erscheint und
+# danach selbst aufräumt. Einen älteren Entwurf veröffentlicht scripts/daily_release.py ohnehin nicht mehr.
 #
 # Von Hand: Actions › „Alte Releases löschen“ › Run workflow; „nur anzeigen“ nennt die Releases, ohne zu löschen.
 name: Alte Releases löschen
@@ -36,24 +37,32 @@ jobs:
           set -euo pipefail
           latest=$(gh release view -R "$REPO" --json tagName --jq .tagName)
           # Ohne Manifest im neuesten Release bekommen die Geräte kein Update; dann lieber nichts anfassen.
-          if ! gh release view "$latest" -R "$REPO" --json assets --jq '.assets[].name' | grep -qxF antoti-release.json; then
+          assets=$(gh release view "$latest" -R "$REPO" --json assets --jq '.assets[].name')
+          if ! grep -qxF antoti-release.json <<< "$assets"; then
             echo "::error::$latest hat kein antoti-release.json; es wird nichts gelöscht."
             exit 1
           fi
           echo "Neuestes Release: $latest" | tee -a "$GITHUB_STEP_SUMMARY"
-          gh release list -R "$REPO" --limit 1000 --json tagName,isDraft --jq '.[] | "\(.tagName) \(.isDraft)"' |
+          releases=$(gh release list -R "$REPO" --limit 1000 --json tagName,isDraft --jq '.[] | "\(.tagName) \(.isDraft)"')
+          failed=0
           while read -r tag draft; do
-            [ "$tag" = "$latest" ] && continue
-            if [ "$draft" = true ] && [ "$(printf '%s\n%s\n' "${latest#v}" "${tag#v}" | sort -V | tail -n1)" = "${tag#v}" ]; then
-              echo "Bleibt: Entwurf $tag ist neuer als $latest." | tee -a "$GITHUB_STEP_SUMMARY"
+            [ -n "$tag" ] && [ "$tag" != "$latest" ] || continue
+            if [ "$(printf '%s\n%s\n' "${latest#v}" "${tag#v}" | sort -V | tail -n1)" = "${tag#v}" ]; then
+              echo "Bleibt: $tag (Entwurf: $draft) ist neuer als $latest." | tee -a "$GITHUB_STEP_SUMMARY"
               continue
             fi
-            echo "Löschen: $tag (Entwurf: $draft)" | tee -a "$GITHUB_STEP_SUMMARY"
-            [ "$DRY_RUN" = true ] && continue
-            # Ein Entwurf hat noch keinen Tag; nur ein veröffentlichtes Release nimmt seinen mit.
-            if [ "$draft" = true ]; then
-              gh release delete "$tag" -R "$REPO" --yes
-            else
-              gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+            if [ "$DRY_RUN" = true ]; then
+              echo "Würde löschen: $tag (Entwurf: $draft)" | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
             fi
-          done
+            # Ein Entwurf hat noch keinen Tag; nur ein veröffentlichtes Release nimmt seinen mit.
+            cleanup=(--cleanup-tag)
+            [ "$draft" = true ] && cleanup=()
+            if gh release delete "$tag" -R "$REPO" --yes "${cleanup[@]}"; then
+              echo "Gelöscht: $tag (Entwurf: $draft)" | tee -a "$GITHUB_STEP_SUMMARY"
+            else
+              echo "::error::$tag ließ sich nicht löschen."
+              failed=1
+            fi
+          done <<< "$releases"
+          exit "$failed"
