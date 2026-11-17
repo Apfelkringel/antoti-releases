@@ -1,0 +1,59 @@
+# Hier gibt es nur ein Release: das neueste. Sobald eines veröffentlicht ist, löscht dieser Workflow alle anderen
+# samt Tag, auch liegengebliebene Entwürfe älterer Versionen. Geräte (src/antoti/updates.py), die Knöpfe der Website
+# und install-mac.sh lesen nur releases/latest; ältere Fassungen braucht keiner von ihnen.
+# Ein Entwurf einer neueren Version bleibt, denn das ist ein Bau, der noch signiert wird.
+#
+# Von Hand: Actions › „Alte Releases löschen“ › Run workflow; „nur anzeigen“ nennt die Releases, ohne zu löschen.
+name: Alte Releases löschen
+
+on:
+  release:
+    types: [published]
+  workflow_dispatch:
+    inputs:
+      nur_anzeigen:
+        description: Nur anzeigen, was gelöscht würde
+        type: boolean
+        default: false
+
+permissions:
+  contents: write
+
+concurrency:
+  group: cleanup
+  cancel-in-progress: false
+
+jobs:
+  cleanup:
+    name: Nur das neueste behalten
+    runs-on: ubuntu-latest
+    steps:
+      - env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          DRY_RUN: ${{ inputs.nur_anzeigen || false }}
+        run: |
+          set -euo pipefail
+          latest=$(gh release view -R "$REPO" --json tagName --jq .tagName)
+          # Ohne Manifest im neuesten Release bekommen die Geräte kein Update; dann lieber nichts anfassen.
+          if ! gh release view "$latest" -R "$REPO" --json assets --jq '.assets[].name' | grep -qxF antoti-release.json; then
+            echo "::error::$latest hat kein antoti-release.json; es wird nichts gelöscht."
+            exit 1
+          fi
+          echo "Neuestes Release: $latest" | tee -a "$GITHUB_STEP_SUMMARY"
+          gh release list -R "$REPO" --limit 1000 --json tagName,isDraft --jq '.[] | "\(.tagName) \(.isDraft)"' |
+          while read -r tag draft; do
+            [ "$tag" = "$latest" ] && continue
+            if [ "$draft" = true ] && [ "$(printf '%s\n%s\n' "${latest#v}" "${tag#v}" | sort -V | tail -n1)" = "${tag#v}" ]; then
+              echo "Bleibt: Entwurf $tag ist neuer als $latest." | tee -a "$GITHUB_STEP_SUMMARY"
+              continue
+            fi
+            echo "Löschen: $tag (Entwurf: $draft)" | tee -a "$GITHUB_STEP_SUMMARY"
+            [ "$DRY_RUN" = true ] && continue
+            # Ein Entwurf hat noch keinen Tag; nur ein veröffentlichtes Release nimmt seinen mit.
+            if [ "$draft" = true ]; then
+              gh release delete "$tag" -R "$REPO" --yes
+            else
+              gh release delete "$tag" -R "$REPO" --yes --cleanup-tag
+            fi
+          done
