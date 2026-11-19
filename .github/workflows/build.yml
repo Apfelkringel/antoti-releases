@@ -150,7 +150,12 @@ jobs:
         run: |
           ls -la
           for file in Antoti*; do
-            echo "\`$file\` $(wc -c < "$file" | tr -d ' ') Bytes, SHA-256 $(python -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$file")" >> "$GITHUB_STEP_SUMMARY"
+            size=$(wc -c < "$file" | tr -d ' ')
+            sha256=$(python -c 'import hashlib, sys; print(hashlib.sha256(open(sys.argv[1], "rb").read()).hexdigest())' "$file")
+            echo "\`$file\` $size Bytes, SHA-256 $sha256" >> "$GITHUB_STEP_SUMMARY"
+            # scripts/daily_release.py in antoti vergleicht diese Annotation mit dem Digest, den GitHub für die Datei im
+            # Entwurf nennt, statt beide Dateien zu laden. Wer nur Releases schreiben darf, kann sie nicht ändern.
+            echo "::notice title=Installer::$file $size $sha256"
           done
 
       - name: Datei ablegen
