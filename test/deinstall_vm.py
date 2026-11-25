@@ -57,7 +57,7 @@ def dialogs():
     for window in Desktop(backend="uia").windows(visible_only=True):
         try:
             title, kind = window.window_text(), window.class_name()
-            if kind != "#32770" and not kind.startswith("TTaskDialog") and "Uninstall" not in title:
+            if "Antoti" not in title:
                 continue
             texts = [item.window_text() for item in window.descendants() if item.window_text().strip()]
             found.append((window, "%s [%s]" % (title, kind), texts))
@@ -90,7 +90,9 @@ def uninstall(answer_data):
             key = (title, tuple(texts))
             text = " ".join(texts)
             lower = text.lower()
-            if "really delete" in lower:
+            if "successfully removed" in lower:
+                labels = {"OK"}
+            elif "really delete" in lower:
                 labels = {"Delete everything"} if answer_data == "loeschen" else {"Keep the data"}
             elif "what should happen" in lower:
                 labels = {"Delete everything"} if answer_data == "loeschen" else {"Keep the data"}
