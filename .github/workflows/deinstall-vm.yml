@@ -40,7 +40,9 @@ jobs:
           REPO: ${{ github.repository }}
           BAU: ${{ inputs.bau }}
         run: |
-          if ($env:BAU) { gh run download $env:BAU -R $env:REPO -n windows-x86_64 -D setup }
+          $bau = "$env:BAU".Trim()
+          if ($bau -and $bau -notmatch '^\d+$') { throw "bau ist keine Lauf-ID: $bau" }
+          if ($bau) { gh run download $bau -R $env:REPO -n windows-x86_64 -D setup }
           else { gh release download -R $env:REPO -p 'Antoti-Setup-*.exe' -D setup }
           if ($LASTEXITCODE) { exit $LASTEXITCODE }
           Get-ChildItem setup | ForEach-Object { "{0} {1}" -f $_.Name, (Get-FileHash $_.FullName).Hash }
@@ -50,7 +52,9 @@ jobs:
           ANTOTI_TRESOR_URL: "off"
         run: |
           python -m pip install --disable-pip-version-check --quiet pywinauto
+          if ($LASTEXITCODE) { exit $LASTEXITCODE }
           $setup = (Get-ChildItem setup -Filter Antoti-Setup-*.exe | Select-Object -First 1).FullName
+          if (-not $setup) { throw "Kein Antoti-Setup-*.exe im Download" }
           python test/deinstall_vm.py --setup $setup --daten ${{ matrix.daten }} --arbeit arbeit
 
       - name: Bericht

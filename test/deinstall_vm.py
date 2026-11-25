@@ -1,6 +1,6 @@
 """Prüft auf einem frischen Windows, was die Deinstallation von Antoti mit den Daten macht. Sie startet den Befehl, den
 Windows unter „Einstellungen › Apps“ aufruft (UninstallString aus der Registry), schreibt jeden Dialog mit und
-beantwortet ihn: die Bestätigung mit Ja, die Frage nach den Daten mit der Antwort aus --daten (behalten = Nein).
+beantwortet ihn: die Bestätigung mit Ja, die Frage nach den Daten und die Rückfrage mit der Antwort aus --daten.
 Danach prüft sie, ob die Marken im Datenordner noch da sind, und endet mit 1, wenn das nicht zur Antwort passt:
 „behalten“ und „still“ behalten alles, „löschen“ lässt keinen Datenordner zurück. Bericht in <arbeit>\\bericht.json.
 """
@@ -66,13 +66,38 @@ def dialogs():
     return found
 
 
-def press(window, labels):
-    for item in window.descendants(control_type="Button"):
-        name = item.window_text().replace("&", "")
-        if any(name == label or name.startswith(label + "\n") or name.startswith(label + " ") for label in labels):
-            item.invoke()
-            return name
+# Die Dialoge der Deinstallation, am Text erkannt: (Kennung, Text, Knopf; None heißt nichts drücken). Ein Fenster von
+# Antoti, das keiner davon ist, beendet den Lauf als Abweichung, statt es wegzuklicken.
+KINDS = (("schluss", "successfully removed", "OK"), ("sicher", "really delete", None),
+         ("frage", "what should happen", None), ("bestaetigen", "completely remove", "Yes"),
+         ("fortschritt", "please wait while antoti is removed", None))
+EXPECTED = {"behalten": ["bestaetigen", "frage", "schluss"], "loeschen": ["bestaetigen", "frage", "sicher", "schluss"],
+            "still": []}
+
+
+def kind_of(lower):
+    return next((kind for kind, text, _ in KINDS if text in lower), None)
+
+
+def press(window, label):
+    try:
+        for item in window.descendants(control_type="Button"):
+            name = item.window_text().replace("&", "")
+            if name == label or name.startswith(label + "\n") or name.startswith(label + " "):
+                item.invoke()
+                return name
+    except Exception:
+        return None
     return None
+
+
+def uninstaller_runs():
+    """True, solange ein Prozess des Deinstallers läuft; None, wenn tasklist nicht antwortet."""
+    listing = subprocess.run(["tasklist", "/FO", "CSV", "/NH"], capture_output=True, text=True)
+    if listing.returncode != 0 or not listing.stdout.strip():
+        return None
+    names = [line.split('","')[0].strip('"').lower() for line in listing.stdout.splitlines() if line]
+    return any(name.startswith(("_iu", "unins")) for name in names)
 
 
 def uninstall(answer_data):
@@ -80,55 +105,48 @@ def uninstall(answer_data):
     step("Befehl aus der Registry", UninstallString=command, QuietUninstallString=registry("QuietUninstallString"))
     if answer_data == "still":
         command += " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
+    choice = "Delete everything" if answer_data == "loeschen" else "Keep the data"
     process = subprocess.Popen(command)
-    seen = set()
+    seen, answered, problems = set(), [], []
     deadline = time.monotonic() + 15 * 60
-    listed = time.monotonic() + 20
     done = False
-    while time.monotonic() < deadline:
+    while time.monotonic() < deadline and not problems:
         for window, title, texts in dialogs():
-            key = (title, tuple(texts))
-            text = " ".join(texts)
-            lower = text.lower()
-            if "successfully removed" in lower:
-                labels = {"OK"}
-            elif "really delete" in lower:
-                labels = {"Delete everything"} if answer_data == "loeschen" else {"Keep the data"}
-            elif "what should happen" in lower:
-                labels = {"Delete everything"} if answer_data == "loeschen" else {"Keep the data"}
-            elif "data" in lower:
-                labels = {"Yes"} if answer_data == "loeschen" else {"No"}
-            elif "remove" in lower:
-                labels = {"Yes"}
-            else:
-                labels = {"OK"}
-            pressed = press(window, labels)
-            if key not in seen or pressed:
-                report["dialoge"].append({"zeit": time.strftime("%H:%M:%S"), "titel": title, "texte": texts,
-                                          "gedrueckt": pressed})
-                print("Dialog:", title, texts, "->", pressed, flush=True)
-                seen.add(key)
-        if listed and time.monotonic() > listed:
-            listed = None
-            everything = []
-            for window in Desktop(backend="uia").windows(visible_only=True):
-                try:
-                    everything.append("%s [%s]" % (window.window_text(), window.class_name()))
-                except Exception:
-                    continue
-            step("Fenster nach 20 s", fenster=everything)
-        if process.poll() is not None and not any(True for _ in dialogs()):
-            names = subprocess.run(["tasklist"], capture_output=True, text=True).stdout.lower()
-            if "_iu" not in names and "unins" not in names:
-                done = True
-                break
+            lower = " ".join(texts).lower()
+            kind = kind_of(lower)
+            label = next((button for name, _, button in KINDS if name == kind), None)
+            if kind in ("sicher", "frage"):
+                label = choice
+            pressed = press(window, label) if label and answer_data != "still" else None
+            if pressed and kind not in answered:
+                answered.append(kind)
+            if (title, tuple(texts)) not in seen or pressed:
+                report["dialoge"].append({"zeit": time.strftime("%H:%M:%S"), "titel": title, "art": kind,
+                                          "texte": texts, "gedrueckt": pressed})
+                print("Dialog:", kind, title, texts, "->", pressed, flush=True)
+                seen.add((title, tuple(texts)))
+            if kind is None or answer_data == "still":
+                problems.append("Unerwartetes Fenster: %s %s" % (title, texts[:3]))
+            if kind == "schluss" and "could not be removed" in lower:
+                problems.append("Deinstaller meldet Reste: %s" % texts[:3])
+        if not problems and process.poll() is not None and not dialogs() and uninstaller_runs() is False:
+            done = True
+            break
         time.sleep(0.5)
-    return {"exitcode_starter": process.poll(), "fertig": done}
+    return {"exitcode_starter": process.poll(), "fertig": done, "beantwortet": answered, "fehler": problems}
 
 
 def verdict(answer_data, state, finished):
     """Gibt die Abweichungen vom erwarteten Ergebnis zurück, leer, wenn alles stimmt."""
-    problems = [] if finished["fertig"] else ["Deinstallation lief nach 15 Minuten noch"]
+    problems = list(finished["fehler"])
+    if not finished["fertig"] and not problems:
+        problems.append("Deinstallation lief nach 15 Minuten noch")
+    if finished["exitcode_starter"] != 0:
+        problems.append("Deinstaller endete mit %s" % finished["exitcode_starter"])
+    if registry("UninstallString") is not None:
+        problems.append("Antoti ist noch als App eingetragen")
+    if finished["beantwortet"] != EXPECTED[answer_data]:
+        problems.append("Dialoge %s, erwartet %s" % (finished["beantwortet"], EXPECTED[answer_data]))
     if answer_data == "loeschen":
         problems += ["Datenordner blieb: %s" % state["inhalt"]] if state["daten_ordner"] else []
     else:
@@ -153,11 +171,16 @@ def main():
         (DATA / "marke.txt").write_text("Daten vor der Deinstallation\n", encoding="utf-8")
         (DATA / "desktop").mkdir(exist_ok=True)
         (DATA / "desktop" / "passwords.json").write_text('{"entries": [], "never": []}', encoding="utf-8")
-        step("1 installiert", exitcode=code, konsole=console_answers(), **data_state())
-        finished = uninstall(args.daten)
-        state = data_state()
-        step("2 deinstalliert", antwort_daten=args.daten, **finished, **state)
-        report["abweichungen"] = verdict(args.daten, state, finished)
+        installed = data_state()
+        step("1 installiert", exitcode=code, konsole=console_answers(), **installed)
+        if code != 0 or console_answers() is None or not installed["konten"]:
+            report["abweichungen"] = ["Installation nicht bereit: Exitcode %s, Konsole %s, Konten %s"
+                                      % (code, console_answers(), installed["konten"])]
+        else:
+            finished = uninstall(args.daten)
+            state = data_state()
+            step("2 deinstalliert", antwort_daten=args.daten, **finished, **state)
+            report["abweichungen"] = verdict(args.daten, state, finished)
     finally:
         (work / "bericht.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     for problem in report["abweichungen"]:
