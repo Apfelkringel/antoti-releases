@@ -66,17 +66,21 @@ def dialogs():
     return found
 
 
-# Die Dialoge der Deinstallation, am Text erkannt: (Kennung, Text, Knopf; None heißt nichts drücken). Ein Fenster von
-# Antoti, das keiner davon ist, beendet den Lauf als Abweichung, statt es wegzuklicken.
+# Die Dialoge der Deinstallation, am Text erkannt: (Kennung, Text, Knopf; None heißt nichts drücken). Fragen und
+# Meldungen erscheinen im Fenster des Fortschritts; als Fortschritt zählt es nur, solange es keinen anderen Text zeigt.
+# Ein Fenster von Antoti, das nichts davon ist, beendet den Lauf als Abweichung, statt es wegzuklicken.
 KINDS = (("schluss", "successfully removed", "OK"), ("sicher", "really delete", None),
-         ("frage", "what should happen", None), ("bestaetigen", "completely remove", "Yes"),
-         ("fortschritt", "please wait while antoti is removed", None))
+         ("frage", "what should happen", None), ("bestaetigen", "completely remove", "Yes"))
+PROGRESS = {"uninstall status", "please wait while antoti is removed from your computer.", "uninstalling antoti...",
+            "cancel", "close"}
 EXPECTED = {"behalten": ["bestaetigen", "frage", "schluss"], "loeschen": ["bestaetigen", "frage", "sicher", "schluss"],
             "still": []}
 
 
-def kind_of(lower):
-    return next((kind for kind, text, _ in KINDS if text in lower), None)
+def kind_of(texts):
+    lower = [text.strip().lower() for text in texts]
+    found = next((kind for kind, text, _ in KINDS if text in " ".join(lower)), None)
+    return found or ("fortschritt" if set(lower) <= PROGRESS else None)
 
 
 def press(window, label):
@@ -100,8 +104,7 @@ def uninstaller_runs():
     return any(name.startswith(("_iu", "unins")) for name in names)
 
 
-def uninstall(answer_data):
-    command = registry("UninstallString")
+def uninstall(answer_data, command):
     step("Befehl aus der Registry", UninstallString=command, QuietUninstallString=registry("QuietUninstallString"))
     if answer_data == "still":
         command += " /VERYSILENT /SUPPRESSMSGBOXES /NORESTART"
@@ -112,8 +115,7 @@ def uninstall(answer_data):
     done = False
     while time.monotonic() < deadline and not problems:
         for window, title, texts in dialogs():
-            lower = " ".join(texts).lower()
-            kind = kind_of(lower)
+            kind = kind_of(texts)
             label = next((button for name, _, button in KINDS if name == kind), None)
             if kind in ("sicher", "frage"):
                 label = choice
@@ -127,8 +129,6 @@ def uninstall(answer_data):
                 seen.add((title, tuple(texts)))
             if kind is None or answer_data == "still":
                 problems.append("Unerwartetes Fenster: %s %s" % (title, texts[:3]))
-            if kind == "schluss" and "could not be removed" in lower:
-                problems.append("Deinstaller meldet Reste: %s" % texts[:3])
         if not problems and process.poll() is not None and not dialogs() and uninstaller_runs() is False:
             done = True
             break
@@ -136,7 +136,7 @@ def uninstall(answer_data):
     return {"exitcode_starter": process.poll(), "fertig": done, "beantwortet": answered, "fehler": problems}
 
 
-def verdict(answer_data, state, finished):
+def verdict(answer_data, state, finished, app):
     """Gibt die Abweichungen vom erwarteten Ergebnis zurück, leer, wenn alles stimmt."""
     problems = list(finished["fehler"])
     if not finished["fertig"] and not problems:
@@ -145,6 +145,10 @@ def verdict(answer_data, state, finished):
         problems.append("Deinstaller endete mit %s" % finished["exitcode_starter"])
     if registry("UninstallString") is not None:
         problems.append("Antoti ist noch als App eingetragen")
+    if app.exists():
+        problems.append("Programmordner blieb: %s" % app)
+    if console_answers() is not None:
+        problems.append("Die Konsole antwortet noch")
     if finished["beantwortet"] != EXPECTED[answer_data]:
         problems.append("Dialoge %s, erwartet %s" % (finished["beantwortet"], EXPECTED[answer_data]))
     if answer_data == "loeschen":
@@ -166,21 +170,21 @@ def main():
         code = subprocess.run([str(args.setup.resolve()), "/VERYSILENT", "/SUPPRESSMSGBOXES", "/NORESTART",
                                "/MODE=server", "/LOG=" + str(work / "install.log")], timeout=20 * 60).returncode
         started = time.monotonic()
-        while console_answers() is None and time.monotonic() - started < 300:
+        while code == 0 and console_answers() is None and time.monotonic() - started < 300:
             time.sleep(3)
-        (DATA / "marke.txt").write_text("Daten vor der Deinstallation\n", encoding="utf-8")
-        (DATA / "desktop").mkdir(exist_ok=True)
-        (DATA / "desktop" / "passwords.json").write_text('{"entries": [], "never": []}', encoding="utf-8")
-        installed = data_state()
-        step("1 installiert", exitcode=code, konsole=console_answers(), **installed)
-        if code != 0 or console_answers() is None or not installed["konten"]:
-            report["abweichungen"] = ["Installation nicht bereit: Exitcode %s, Konsole %s, Konten %s"
-                                      % (code, console_answers(), installed["konten"])]
+        console, command, installed = console_answers(), registry("UninstallString"), data_state()
+        step("1 installiert", exitcode=code, konsole=console, **installed)
+        if code != 0 or console is None or command is None or not installed["konten"]:
+            report["abweichungen"] = ["Installation nicht bereit: Exitcode %s, Konsole %s, Eintrag %s, Konten %s"
+                                      % (code, console, command, installed["konten"])]
         else:
-            finished = uninstall(args.daten)
+            (DATA / "marke.txt").write_text("Daten vor der Deinstallation\n", encoding="utf-8")
+            (DATA / "desktop").mkdir(exist_ok=True)
+            (DATA / "desktop" / "passwords.json").write_text('{"entries": [], "never": []}', encoding="utf-8")
+            finished = uninstall(args.daten, command)
             state = data_state()
             step("2 deinstalliert", antwort_daten=args.daten, **finished, **state)
-            report["abweichungen"] = verdict(args.daten, state, finished)
+            report["abweichungen"] = verdict(args.daten, state, finished, Path(command.strip('"')).parent)
     finally:
         (work / "bericht.json").write_text(json.dumps(report, ensure_ascii=False, indent=2), encoding="utf-8")
     for problem in report["abweichungen"]:
