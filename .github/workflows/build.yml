@@ -134,12 +134,12 @@ jobs:
           fi
           keychain="$RUNNER_TEMP/antoti-sign.keychain-db"
           password=$(openssl rand -hex 16)
+          trap 'rm -f "$RUNNER_TEMP/antoti-sign.p12"' EXIT
           printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/antoti-sign.p12"
           security create-keychain -p "$password" "$keychain"
           security set-keychain-settings -lut 21600 "$keychain"
           security unlock-keychain -p "$password" "$keychain"
-          security import "$RUNNER_TEMP/antoti-sign.p12" -k "$keychain" -P "$P12_PASSWORD" -T /usr/bin/codesign
-          rm -f "$RUNNER_TEMP/antoti-sign.p12"
+          security import "$RUNNER_TEMP/antoti-sign.p12" -k "$keychain" -P "$P12_PASSWORD" -x -T /usr/bin/codesign
           security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
           security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
           echo "ANTOTI_MAC_SIGN_IDENTITY=$MAC_SIGN_SHA1" >> "$GITHUB_ENV"
@@ -174,9 +174,9 @@ jobs:
         run: |
           mount=$(mktemp -d)
           hdiutil attach -nobrowse -readonly -mountpoint "$mount" Antoti-*-macos-arm64.dmg > /dev/null
+          trap 'hdiutil detach "$mount" > /dev/null 2>&1 || true' EXIT
           codesign --verify --deep --strict "$mount/Antoti.app"
           requirement=$(codesign -d -r- "$mount/Antoti.app" 2>&1)
-          hdiutil detach "$mount" > /dev/null
           echo "$requirement"
           root=$(echo "$MAC_SIGN_SHA1" | tr 'A-F' 'a-f')
           case "$requirement" in
