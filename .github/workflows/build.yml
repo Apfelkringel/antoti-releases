@@ -4,9 +4,13 @@
 # Der Quellcode kommt aus dem privaten Repository Apfelkringel/antoti, mit einem Deploy-Key, der nur lesen darf
 # (Secret ANTOTI_SOURCE_KEY). Der Google-Client für Kunden (ANTOTI_GOOGLE_CLIENT) steckt ohnehin in jedem Installer.
 #
-# Signiert wird hier nicht: Der Workflow legt die Dateien in einen Entwurf v<Version>. Das Manifest signiert der
-# Hersteller mit seinem Schlüssel außerhalb von GitHub (scripts/release.py sign im Repository antoti) und
+# Das Manifest wird hier nicht signiert: Der Workflow legt die Dateien in einen Entwurf v<Version>. Das Manifest
+# signiert der Hersteller mit seinem Schlüssel außerhalb von GitHub (scripts/release.py sign im Repository antoti) und
 # veröffentlicht erst dann. So kann auch jemand, der dieses Konto übernimmt, keinem Gerät ein Update unterschieben.
+#
+# Die App für macOS trägt dagegen hier eine Codesignatur mit dem festen, selbst ausgestellten Zertifikat „Antoti“
+# (Secrets ANTOTI_MAC_SIGN_P12, ANTOTI_MAC_SIGN_PASSWORD). Ad hoc signiert wäre jede Fassung für macOS eine neue App,
+# und Freigaben wie der Zugriff auf Wechselmedien gingen bei jedem Update verloren.
 #
 # Starten: Actions › „Installer bauen“ › Run workflow, oder
 #   gh workflow run build.yml -R Apfelkringel/antoti-releases -f ref=<Commit oder Branch>
@@ -38,6 +42,8 @@ concurrency:
   cancel-in-progress: false
 
 env:
+  # SHA-1 des Zertifikats „Antoti“; ein anderes Zertifikat im Secret lässt codesign scheitern, statt still zu wechseln.
+  MAC_SIGN_SHA1: C88DEC56D38D5ED5D6019109B3AC87399DC4308C
   INNO_VERSION: 6.7.1
   # SHA-256 des NuGet-Pakets Tools.InnoSetup 6.7.1; dasselbe ISCC.exe, mit dem bisher gebaut wurde.
   INNO_SHA256: 00a5a07e8a4bd3a30364cb579d744677b37adfc22e365099cb01b8bd1e651828
@@ -117,6 +123,27 @@ jobs:
           if [ -z "$GOOGLE_CLIENT" ]; then echo "::error::Secret ANTOTI_GOOGLE_CLIENT fehlt."; exit 1; fi
           printf '%s' "$GOOGLE_CLIENT" > "$RUNNER_TEMP/google-client.json"
 
+      - name: Signierzertifikat (macOS)
+        if: matrix.platform == 'darwin-arm64'
+        env:
+          P12: ${{ secrets.ANTOTI_MAC_SIGN_P12 }}
+          P12_PASSWORD: ${{ secrets.ANTOTI_MAC_SIGN_PASSWORD }}
+        run: |
+          if [ -z "$P12" ] || [ -z "$P12_PASSWORD" ]; then
+            echo "::error::Secrets ANTOTI_MAC_SIGN_P12 und ANTOTI_MAC_SIGN_PASSWORD fehlen."; exit 1
+          fi
+          keychain="$RUNNER_TEMP/antoti-sign.keychain-db"
+          password=$(openssl rand -hex 16)
+          trap 'rm -f "$RUNNER_TEMP/antoti-sign.p12"' EXIT
+          printf '%s' "$P12" | base64 --decode > "$RUNNER_TEMP/antoti-sign.p12"
+          security create-keychain -p "$password" "$keychain"
+          security set-keychain-settings -lut 21600 "$keychain"
+          security unlock-keychain -p "$password" "$keychain"
+          security import "$RUNNER_TEMP/antoti-sign.p12" -k "$keychain" -P "$P12_PASSWORD" -x -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple: -s -k "$password" "$keychain" > /dev/null
+          security list-keychains -d user -s "$keychain" $(security list-keychains -d user | tr -d '"')
+          echo "ANTOTI_MAC_SIGN_IDENTITY=$MAC_SIGN_SHA1" >> "$GITHUB_ENV"
+
       - name: Paket bauen
         working-directory: antoti
         # Ohne --platform baut das Skript für das System, auf dem es läuft; --platform hieße nur laden.
@@ -140,6 +167,26 @@ jobs:
         if: matrix.platform != 'windows-x86_64'
         working-directory: antoti
         run: python scripts/build_posix_package.py
+
+      - name: Signatur prüfen (macOS)
+        if: matrix.platform == 'darwin-arm64'
+        working-directory: antoti/build/installer
+        run: |
+          mount=$(mktemp -d)
+          hdiutil attach -nobrowse -readonly -mountpoint "$mount" Antoti-*-macos-arm64.dmg > /dev/null
+          trap 'hdiutil detach "$mount" > /dev/null 2>&1 || true' EXIT
+          codesign --verify --deep --strict "$mount/Antoti.app"
+          requirement=$(codesign -d -r- "$mount/Antoti.app" 2>&1)
+          echo "$requirement"
+          root=$(echo "$MAC_SIGN_SHA1" | tr 'A-F' 'a-f')
+          case "$requirement" in
+            *"identifier \"com.antoti.desktop\" and certificate root = H\"$root\""*) ;;
+            *) echo "::error::Die App trägt nicht die Signatur des Zertifikats Antoti."; exit 1 ;;
+          esac
+
+      - name: Signierzertifikat entfernen
+        if: always() && matrix.platform == 'darwin-arm64'
+        run: security delete-keychain "$RUNNER_TEMP/antoti-sign.keychain-db" 2>/dev/null || true
 
       - name: Google-Client entfernen
         if: always()
